@@ -68,4 +68,10 @@ public class TrickplayOptions
     /// Gets or sets the number of threads to be used by ffmpeg.
     /// </summary>
     public int ProcessThreads { get; set; } = 1;
+
+    /// <summary>
+    /// Gets or sets the number of consecutive generation failures after which an item is skipped
+    /// until its media changes. A value of 0 or less disables skipping and always retries.
+    /// </summary>
+    public int MaxGenerationFailures { get; set; } = 3;
 }
