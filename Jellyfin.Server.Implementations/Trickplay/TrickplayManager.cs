@@ -16,6 +16,7 @@ using MediaBrowser.Controller.Configuration;
 using MediaBrowser.Controller.Drawing;
 using MediaBrowser.Controller.Entities;
 using MediaBrowser.Controller.IO;
+using MediaBrowser.Controller.Library;
 using MediaBrowser.Controller.MediaEncoding;
 using MediaBrowser.Controller.Trickplay;
 using MediaBrowser.Model.Configuration;
@@ -40,9 +41,12 @@ public partial class TrickplayManager : ITrickplayManager
     private readonly IDbContextFactory<JellyfinDbContext> _dbProvider;
     private readonly IApplicationPaths _appPaths;
     private readonly IPathManager _pathManager;
+    private readonly ILibraryManager _libraryManager;
 
     private static readonly AsyncNonKeyedLocker _resourcePool = new(1);
     private static readonly string[] _trickplayImgExtensions = [".jpg"];
+
+    private readonly TrickplayFailureTracker _failureTracker = new();
 
     /// <summary>
     /// Initializes a new instance of the <see cref="TrickplayManager"/> class.
@@ -56,6 +60,7 @@ public partial class TrickplayManager : ITrickplayManager
     /// <param name="dbProvider">The database provider.</param>
     /// <param name="appPaths">The application paths.</param>
     /// <param name="pathManager">The path manager.</param>
+    /// <param name="libraryManager">The library manager.</param>
     public TrickplayManager(
         ILogger<TrickplayManager> logger,
         IMediaEncoder mediaEncoder,
@@ -65,7 +70,8 @@ public partial class TrickplayManager : ITrickplayManager
         IImageEncoder imageEncoder,
         IDbContextFactory<JellyfinDbContext> dbProvider,
         IApplicationPaths appPaths,
-        IPathManager pathManager)
+        IPathManager pathManager,
+        ILibraryManager libraryManager)
     {
         _logger = logger;
         _mediaEncoder = mediaEncoder;
@@ -76,13 +82,25 @@ public partial class TrickplayManager : ITrickplayManager
         _dbProvider = dbProvider;
         _appPaths = appPaths;
         _pathManager = pathManager;
+        _libraryManager = libraryManager;
+
+        // Evict failure records for removed items so the map stays bounded to the live library.
+        // TrickplayManager and ILibraryManager are both singletons, so no unsubscribe is needed.
+        // Note: bulk DeleteItemsUnsafeFast does not raise ItemRemoved; those records are instead
+        // reclaimed on the next successful generation, a media size change, or a restart.
+        _libraryManager.ItemRemoved += OnItemRemoved;
+    }
+
+    private void OnItemRemoved(object? sender, ItemChangeEventArgs e)
+    {
+        _failureTracker.Clear(e.Item.Id);
     }
 
     /// <inheritdoc />
     public async Task MoveGeneratedTrickplayDataAsync(Video video, LibraryOptions libraryOptions, CancellationToken cancellationToken)
     {
         var options = _config.Configuration.TrickplayOptions;
-        if (libraryOptions is null || !libraryOptions.EnableTrickplayImageExtraction || !CanGenerateTrickplay(video, options.Interval))
+        if (libraryOptions is null || !libraryOptions.EnableTrickplayImageExtraction || !CanGenerateTrickplay(video, options.Interval, options.MaxGenerationFailures))
         {
             return;
         }
@@ -281,7 +299,7 @@ public partial class TrickplayManager : ITrickplayManager
     public async Task RefreshTrickplayDataAsync(Video video, bool replace, LibraryOptions libraryOptions, CancellationToken cancellationToken)
     {
         var options = _config.Configuration.TrickplayOptions;
-        if (!CanGenerateTrickplay(video, options.Interval) || libraryOptions is null)
+        if (!CanGenerateTrickplay(video, options.Interval, options.MaxGenerationFailures) || libraryOptions is null)
         {
             return;
         }
@@ -517,6 +535,7 @@ public partial class TrickplayManager : ITrickplayManager
                         await SaveTrickplayInfo(trickplayInfo).ConfigureAwait(false);
 
                         _logger.LogInformation("Finished creation of trickplay files for {0}", mediaPath);
+                        _failureTracker.Clear(video.Id);
                     }
                     else
                     {
@@ -535,6 +554,10 @@ public partial class TrickplayManager : ITrickplayManager
             catch (Exception ex)
             {
                 _logger.LogError(ex, "Error creating trickplay images.");
+                _logger.LogDebug(
+                    "Trickplay generation for {ItemId} has failed {Count} time(s)",
+                    video.Id,
+                    _failureTracker.RecordFailure(video.Id, video.Size ?? 0));
             }
             finally
             {
@@ -625,8 +648,16 @@ public partial class TrickplayManager : ITrickplayManager
         }
     }
 
-    private bool CanGenerateTrickplay(Video video, int interval)
+    private bool CanGenerateTrickplay(Video video, int interval, int maxFailures)
     {
+        if (_failureTracker.ShouldSkip(video.Id, video.Size ?? 0, maxFailures))
+        {
+            _logger.LogDebug(
+                "Skipping trickplay for {ItemId}: too many consecutive failures and media unchanged",
+                video.Id);
+            return false;
+        }
+
         var videoType = video.VideoType;
         if (videoType == VideoType.Iso || videoType == VideoType.Dvd || videoType == VideoType.BluRay)
         {
@@ -721,6 +752,7 @@ public partial class TrickplayManager : ITrickplayManager
     /// <inheritdoc />
     public async Task DeleteTrickplayDataAsync(Guid itemId, CancellationToken cancellationToken)
     {
+        _failureTracker.Clear(itemId);
         var dbContext = await _dbProvider.CreateDbContextAsync(cancellationToken).ConfigureAwait(false);
         await dbContext.TrickplayInfos.Where(i => i.ItemId.Equals(itemId)).ExecuteDeleteAsync(cancellationToken).ConfigureAwait(false);
     }
